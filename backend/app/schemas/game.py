@@ -31,14 +31,22 @@ class RoomResponse(BaseModel):
     enemy: str | None = None
 
 
+class QuestStep(BaseModel):
+    label: str
+    done: bool
+
+
 class GameStateResponse(BaseModel):
     id: int
     status: GameStatus
     hp: int
     max_hp: int
     location: str
+    objective: str
+    progress: list[QuestStep]
     room: RoomResponse
     enemy_hp: int
+    enemy_max_hp: int
     inventory: list[InventoryItemResponse]
     alive: bool
     turns: list[TurnResponse]

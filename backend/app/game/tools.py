@@ -5,17 +5,24 @@ handler validates the request against the database state and the static world;
 illegal requests are rejected and nothing is mutated. The AI never mutates
 state directly -- it only proposes tool calls, and narrates whatever result
 the handler returns.
+
+Every handler returns a structured result:
+
+    success  -> {"ok": True,  "message": str, "events": [str, ...]}
+    failure  -> {"ok": False, "error": str}
+
+``execute_tool`` then decorates the result with ``action``, ``previous_state``
+and ``updated_state`` so the AI can narrate strictly from the *updated* state.
 """
 
-from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm import Session
 
 from app.game import state, world
 from app.models import Game, GameStatus
 
 MAX_ENV_DAMAGE = 40
 
-# OpenAI function-calling tool definitions.
 TOOL_DEFINITIONS = [
     {
         "type": "function",
@@ -116,17 +123,19 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def _rejected(reason: str) -> dict:
-    return {"accepted": False, "reason": reason}
+def _fail(error: str) -> dict:
+    return {"ok": False, "error": error}
 
 
-def _accepted(message: str, **extra) -> dict:
-    return {"accepted": True, "result": message, **extra}
+def _ok(message: str, events: list[str] | None = None) -> dict:
+    return {"ok": True, "message": message, "events": events or []}
 
 
 def _check_active(game: Game) -> dict | None:
     if game.status != GameStatus.active:
-        return _rejected(f"The game is over (status: {game.status.value}). No further actions allowed.")
+        return _fail(
+            f"The game is over (status: {game.status.value}). No further actions are allowed."
+        )
     return None
 
 
@@ -134,7 +143,7 @@ def _check_win_lose(game: Game) -> None:
     if game.hp <= 0:
         game.hp = 0
         game.status = GameStatus.lost
-    elif world.WORLD[game.location].is_win:
+    elif "treasure_vault:ancient_relic" in (game.collected_items or []):
         game.status = GameStatus.won
 
 
@@ -143,30 +152,31 @@ def handle_move_player(db: Session, game: Game, args: dict) -> dict:
         return blocked
 
     direction = str(args.get("direction", "")).lower().strip()
-    room = world.WORLD[game.location]
-
-    available = dict(room.exits)
-    if room.locked_exits and not state.enemy_alive(game):
-        available.update(room.locked_exits)
+    room = state.current_room(game)
+    available = state.available_exits(game, room)
 
     if direction not in available:
         if direction in room.locked_exits:
-            return _rejected(
-                f"The path {direction} is blocked while the {room.enemy or 'guardian'} "
+            return _fail(
+                f"The path {direction} is sealed while the {room.enemy or 'guardian'} "
                 "still lives. Defeat it first."
             )
-        return _rejected(
+        return _fail(
             f"There is no exit to the {direction or '(none given)'} from {room.name}. "
             f"Valid exits: {', '.join(available) or 'none'}."
         )
 
     game.location = available[direction]
-    new_room = world.WORLD[game.location]
+    new_room = state.current_room(game)
     _check_win_lose(game)
-    return _accepted(
-        f"Moved {direction} into {new_room.name}.",
-        location=game.location,
-        won=game.status == GameStatus.won,
+
+    events = [f"Moved to {new_room.name}."]
+    if game.status == GameStatus.won:
+        events.append("You have entered the Treasure Vault. The quest is complete!")
+
+    return _ok(
+        f"Player moved from {room.name} to {new_room.name}.",
+        events,
     )
 
 
@@ -174,15 +184,15 @@ def handle_attack(db: Session, game: Game, args: dict) -> dict:
     if (blocked := _check_active(game)) is not None:
         return blocked
 
-    room = world.WORLD[game.location]
+    room = state.current_room(game)
     if room.enemy is None:
-        return _rejected("There is no enemy here to attack.")
+        return _fail("There is no enemy here to attack.")
     if not state.enemy_alive(game):
-        return _rejected(f"The {room.enemy} is already dead.")
+        return _fail(f"The {room.enemy} is already dead.")
 
     target = str(args.get("target", "")).lower().strip()
     if target and room.enemy not in target and target not in room.enemy:
-        return _rejected(f"There is no '{target}' here. The enemy here is the {room.enemy}.")
+        return _fail(f"There is no '{target}' here. The enemy here is the {room.enemy}.")
 
     has_sword = state.has_item(game, world.ITEM_IRON_SWORD)
     damage = world.SWORD_DAMAGE if has_sword else world.FISTS_DAMAGE
@@ -190,23 +200,29 @@ def handle_attack(db: Session, game: Game, args: dict) -> dict:
     weapon = "iron sword" if has_sword else "bare fists"
 
     if game.enemy_hp <= 0:
-        return _accepted(
-            f"You strike the {room.enemy} with your {weapon} for {damage} damage. "
-            f"The {room.enemy} collapses, defeated! The path north from the hall is now open.",
-            enemy_hp=0,
-            enemy_defeated=True,
+        return _ok(
+            f"You strike the {room.enemy} with your {weapon} for {damage} damage and it collapses, defeated.",
+            [
+                f"The {room.enemy} is defeated.",
+                "The northern door in the Great Hall is now unlocked.",
+            ],
         )
 
     counter = world.ENEMY_ATTACK
     game.hp = max(0, game.hp - counter)
     _check_win_lose(game)
-    return _accepted(
+
+    events = [
+        f"Goblin HP is now {game.enemy_hp}.",
+        f"You took {counter} damage (HP now {game.hp}).",
+    ]
+    if game.status == GameStatus.lost:
+        events.append("You have fallen in battle.")
+
+    return _ok(
         f"You hit the {room.enemy} with your {weapon} for {damage} damage "
-        f"(enemy HP now {game.enemy_hp}). The {room.enemy} retaliates for {counter} damage "
-        f"(your HP now {game.hp}).",
-        enemy_hp=game.enemy_hp,
-        player_hp=game.hp,
-        player_dead=game.hp <= 0,
+        f"(enemy HP now {game.enemy_hp}); it retaliates for {counter} (your HP now {game.hp}).",
+        events,
     )
 
 
@@ -214,31 +230,35 @@ def handle_pick_up_item(db: Session, game: Game, args: dict) -> dict:
     if (blocked := _check_active(game)) is not None:
         return blocked
 
-    item = str(args.get("item", "")).lower().strip()
-    room = world.WORLD[game.location]
+    item = world.resolve_item(args.get("item", ""))
+    room = state.current_room(game)
     key = f"{room.id}:{item}"
 
     if item not in room.items:
-        return _rejected(f"There is no '{item}' to pick up in {room.name}.")
+        return _fail(f"There is no '{item}' to pick up in {room.name}.")
     if key in (game.collected_items or []):
-        return _rejected(f"The {item} here has already been taken.")
+        return _fail(f"The {item} here has already been taken.")
 
     state.add_inventory(db, game, item, 1)
     game.collected_items = list(game.collected_items or []) + [key]
     flag_modified(game, "collected_items")
-    return _accepted(f"Picked up {item}.", item=item)
+    events = [f"{item} added to your inventory."]
+    if item == world.ITEM_ANCIENT_RELIC and room.id == "treasure_vault":
+        game.status = GameStatus.won
+        events.append("You claim the Ancient Relic. Quest complete!")
+    return _ok(f"Picked up {item}.", events)
 
 
 def handle_drop_item(db: Session, game: Game, args: dict) -> dict:
     if (blocked := _check_active(game)) is not None:
         return blocked
 
-    item = str(args.get("item", "")).lower().strip()
+    item = world.resolve_item(args.get("item", ""))
     if not state.has_item(game, item):
-        return _rejected(f"You are not carrying a '{item}'.")
+        return _fail(f"You are not carrying a '{item}'.")
 
     state.remove_inventory(db, game, item, 1)
-    return _accepted(f"Dropped {item}.", item=item)
+    return _ok(f"Dropped {item}.", [f"{item} removed from your inventory."])
 
 
 def handle_heal_player(db: Session, game: Game, args: dict) -> dict:
@@ -246,16 +266,20 @@ def handle_heal_player(db: Session, game: Game, args: dict) -> dict:
         return blocked
 
     if not state.has_item(game, world.ITEM_HEALTH_POTION):
-        return _rejected("You have no health potion to drink.")
+        return _fail("You have no health potion to drink.")
     if game.hp >= world.MAX_HP:
-        return _rejected("You are already at full health.")
+        return _fail("You are already at full health.")
 
     state.remove_inventory(db, game, world.ITEM_HEALTH_POTION, 1)
     healed_from = game.hp
     game.hp = min(world.MAX_HP, game.hp + world.POTION_HEAL_AMOUNT)
-    return _accepted(
-        f"Drank a health potion, restoring {game.hp - healed_from} HP (now {game.hp}).",
-        player_hp=game.hp,
+    restored = game.hp - healed_from
+    return _ok(
+        f"Drank a health potion, restoring {restored} HP (now {game.hp}).",
+        [
+            f"Restored {restored} HP (now {game.hp}/{world.MAX_HP}).",
+            "One health potion consumed.",
+        ],
     )
 
 
@@ -265,21 +289,22 @@ def handle_apply_damage(db: Session, game: Game, args: dict) -> dict:
 
     target = str(args.get("target", "")).lower().strip()
     if target != "player":
-        return _rejected("apply_damage can only target 'player'.")
+        return _fail("apply_damage can only target 'player'.")
 
     amount = args.get("amount")
     if not isinstance(amount, int) or amount <= 0:
-        return _rejected("Damage amount must be a positive integer.")
+        return _fail("Damage amount must be a positive integer.")
     if amount > MAX_ENV_DAMAGE:
-        return _rejected(f"Damage amount exceeds the maximum allowed ({MAX_ENV_DAMAGE}).")
+        return _fail(f"Damage amount exceeds the maximum allowed ({MAX_ENV_DAMAGE}).")
 
     game.hp = max(0, game.hp - amount)
     _check_win_lose(game)
-    return _accepted(
-        f"The player takes {amount} damage (HP now {game.hp}).",
-        player_hp=game.hp,
-        player_dead=game.hp <= 0,
-    )
+
+    events = [f"You took {amount} damage (HP now {game.hp})."]
+    if game.status == GameStatus.lost:
+        events.append("You have fallen.")
+
+    return _ok(f"The player takes {amount} damage (HP now {game.hp}).", events)
 
 
 HANDLERS = {
@@ -293,7 +318,21 @@ HANDLERS = {
 
 
 def execute_tool(db: Session, game: Game, name: str, args: dict) -> dict:
+    """Run a tool handler and return a fully-decorated structured result.
+
+    The returned dict always contains ``ok``, ``action``, ``previous_state``
+    and ``updated_state`` so the narration step is grounded strictly in the
+    server's authoritative state after the mutation.
+    """
+    previous_state = state.state_summary(game)
     handler = HANDLERS.get(name)
     if handler is None:
-        return _rejected(f"Unknown tool '{name}'.")
-    return handler(db, game, args)
+        result = _fail(f"Unknown tool '{name}'.")
+    else:
+        result = handler(db, game, args)
+
+    result.setdefault("events", [])
+    result["action"] = name
+    result["previous_state"] = previous_state
+    result["updated_state"] = state.state_summary(game)
+    return result

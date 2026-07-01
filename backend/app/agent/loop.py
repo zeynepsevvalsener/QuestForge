@@ -5,11 +5,14 @@ Flow for one player turn:
   2. Reconstruct conversation context from prior turns + the authoritative state.
   3. Resolve tool calls in bounded, non-streamed rounds. Each accepted tool call
      mutates state inside a DB transaction; rejected calls change nothing.
-  4. Make a final streamed narration call (tool_choice=none) so the words the
-     player reads always describe what the server actually did.
+  4. AFTER all tool handlers finish, reload updated_state from the database and
+     make a dedicated streamed narration call whose only inputs are
+     (player_action, previous_state, tool_result, updated_state) -- so the words
+     the player reads always describe what the server actually did.
 """
 
 import json
+import re
 from collections.abc import Iterator
 
 from openai import OpenAI
@@ -38,13 +41,37 @@ def _fallback_narration(executed: list[dict]) -> str:
     """Deterministic, server-grounded narration used only if the model returns
     no text. Built straight from the validated tool results, so it can never
     contradict the authoritative state."""
-    accepted = [e["result"] for e in executed if e.get("accepted") and e.get("result")]
+    accepted = [e for e in executed if e.get("ok")]
     if accepted:
-        return " ".join(accepted)
-    rejected = [e["reason"] for e in executed if not e.get("accepted") and e.get("reason")]
+        parts: list[str] = []
+        for e in accepted:
+            if e.get("message"):
+                parts.append(e["message"])
+            parts.extend(e.get("events") or [])
+        return " ".join(parts) or "Done."
+    rejected = [e["error"] for e in executed if not e.get("ok") and e.get("error")]
     if rejected:
         return "That didn't work. " + " ".join(rejected)
     return "Nothing happens."
+
+
+_ACTION_INTENT = re.compile(
+    r"\b(go|move|walk|head|travel|enter|return|leave|north|south|east|west|"
+    r"attack|hit|fight|strike|kill|slay|stab|swing|"
+    r"take|grab|pick|loot|collect|"
+    r"drop|discard|"
+    r"drink|heal|quaff|consume)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_action(text: str) -> bool:
+    """True when the player's message clearly requests a state-changing action.
+
+    Used only to force *some* tool call on the first round; the model still
+    decides which tool and arguments (and the handler still validates it).
+    """
+    return bool(_ACTION_INTENT.search(text or ""))
 
 
 def _history_messages(game: Game, limit: int = 12) -> list[dict]:
@@ -63,32 +90,34 @@ def _history_messages(game: Game, limit: int = 12) -> list[dict]:
 
 
 def run_turn(db: Session, game: Game, player_action: str) -> Iterator[str]:
-    # 1. Persist player turn.
     db.add(Turn(game_id=game.id, role=TurnRole.player, content=player_action))
     db.commit()
     db.refresh(game)
 
     yield _sse("start", {"action": player_action})
 
+    previous_state = state.state_summary(game)
+
     messages: list[dict] = [{"role": "system", "content": prompts.SYSTEM_PROMPT}]
     messages.extend(_history_messages(game))
-    messages.append({"role": "system", "content": prompts.build_state_message(state.state_summary(game))})
+    messages.append({"role": "system", "content": prompts.build_state_message(previous_state)})
     messages.append({"role": "user", "content": player_action})
 
     executed: list[dict] = []
     last_content = ""
     client = get_client()
+    force_first_tool = _wants_action(player_action)
 
     try:
-        for _ in range(settings.max_tool_rounds):
+        for round_index in range(settings.max_tool_rounds):
+            tool_choice = (
+                "required" if (round_index == 0 and force_first_tool) else "auto"
+            )
             response = client.chat.completions.create(
                 model=settings.openai_model,
                 messages=messages,
                 tools=tools.TOOL_DEFINITIONS,
-                tool_choice="auto",
-                # Deterministic tool selection -> the model reliably calls the
-                # right tool for state-changing actions instead of narrating
-                # an outcome that never touched the server.
+                tool_choice=tool_choice,
                 temperature=0,
             )
             choice = response.choices[0].message
@@ -127,19 +156,37 @@ def run_turn(db: Session, game: Game, player_action: str) -> Iterator[str]:
                 db.commit()
                 db.refresh(game)
 
-                record = {"tool": name, "args": args, **result}
+                record = {
+                    "tool": name,
+                    "action": result.get("action", name),
+                    "args": args,
+                    "ok": result.get("ok", False),
+                    "message": result.get("message"),
+                    "error": result.get("error"),
+                    "events": result.get("events", []),
+                }
                 executed.append(record)
                 yield _sse("tool", record)
+
+                tool_payload = {
+                    "ok": result.get("ok"),
+                    "action": result.get("action", name),
+                    "events": result.get("events", []),
+                    "updated_state": result.get("updated_state"),
+                }
+                if result.get("ok"):
+                    tool_payload["message"] = result.get("message")
+                else:
+                    tool_payload["error"] = result.get("error")
 
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": json.dumps(result),
+                        "content": json.dumps(tool_payload),
                     }
                 )
 
-            # Refresh authoritative state for the next round.
             messages.append(
                 {
                     "role": "system",
@@ -147,20 +194,26 @@ def run_turn(db: Session, game: Game, player_action: str) -> Iterator[str]:
                 }
             )
 
-        # Final streamed narration grounded strictly in what actually executed.
-        messages.append(
+        db.refresh(game)
+        updated_state = state.state_summary(game)
+
+        narration_messages: list[dict] = [
+            {"role": "system", "content": prompts.NARRATION_PROMPT}
+        ]
+        narration_messages.extend(_history_messages(game))
+        narration_messages.append(
             {
-                "role": "system",
-                "content": prompts.final_narration_instruction(executed),
+                "role": "user",
+                "content": prompts.build_narration_input(
+                    player_action, previous_state, executed, updated_state
+                ),
             }
         )
 
-        # Plain completion (no tools) is the most reliable way to get narration
-        # text back; passing tools here occasionally yields an empty message.
         narration_parts: list[str] = []
         stream = client.chat.completions.create(
             model=settings.openai_model,
-            messages=messages,
+            messages=narration_messages,
             temperature=0.7,
             stream=True,
         )
@@ -173,8 +226,6 @@ def run_turn(db: Session, game: Game, player_action: str) -> Iterator[str]:
         streamed = "".join(narration_parts).strip()
         narration = streamed or last_content.strip() or _fallback_narration(executed)
 
-        # If nothing was streamed live, emit the resolved narration so the UI
-        # still shows the GM's words during this turn (not just after refetch).
         if not streamed and narration:
             yield _sse("token", {"text": narration})
 
@@ -196,7 +247,6 @@ def run_turn(db: Session, game: Game, player_action: str) -> Iterator[str]:
         yield _sse("done", {"status": game.status.value, "hp": game.hp})
         return
 
-    # Persist GM turn with the tool calls it requested + their accept/reject outcomes.
     gm_turn = Turn(
         game_id=game.id,
         role=TurnRole.gm,

@@ -15,15 +15,22 @@ function ToolChips({ tools }: { tools: ToolCallRecord[] }) {
   if (!tools?.length) return null;
   return (
     <div className="tool-chips">
-      {tools.map((t, i) => (
-        <span
-          key={i}
-          className={`chip ${t.accepted ? "accepted" : "rejected"}`}
-          title={t.reason || t.result || ""}
-        >
-          {t.tool} {t.accepted ? "ok" : "rejected"}
-        </span>
-      ))}
+      {tools.map((t, i) => {
+        const ok = (t.ok ?? t.accepted) ?? false;
+        const label = t.action ?? t.tool;
+        const title = t.ok
+          ? t.message || (t.events ?? []).join(" ")
+          : t.error || t.reason || t.result || "";
+        return (
+          <span
+            key={i}
+            className={`chip ${ok ? "accepted" : "rejected"}`}
+            title={title}
+          >
+            {label} {ok ? "ok" : "failed"}
+          </span>
+        );
+      })}
     </div>
   );
 }

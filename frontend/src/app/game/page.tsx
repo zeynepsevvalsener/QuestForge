@@ -15,6 +15,22 @@ import {
 import type { GameState, ToolCallRecord } from "@/lib/types";
 import { useAuth } from "@/hooks/useAuth";
 
+function suggestedCommands(game: GameState): string[] {
+  const cmds: string[] = ["look around"];
+  const exits = game.room?.exits ? Object.keys(game.room.exits) : [];
+  for (const dir of ["north", "south", "east", "west"]) {
+    if (exits.includes(dir)) cmds.push(`go ${dir}`);
+  }
+  const itemsHere = game.room?.items ?? [];
+  if (itemsHere.includes("iron_sword")) cmds.push("take sword");
+  if (itemsHere.includes("health_potion")) cmds.push("take potion");
+  if (itemsHere.includes("ancient_relic")) cmds.push("take reward");
+  if (game.room?.enemy === "goblin") cmds.push("attack goblin");
+  if (game.inventory.some((i) => i.item === "health_potion")) cmds.push("drink potion");
+  cmds.push("check inventory");
+  return cmds;
+}
+
 export default function GamePage() {
   const { ready, isAuthenticated, logout } = useAuth(true);
   const queryClient = useQueryClient();
@@ -84,7 +100,6 @@ export default function GamePage() {
     } finally {
       setBusy(false);
       setLive((prev) => (prev ? { ...prev, streaming: false } : prev));
-      // Refresh authoritative state, then drop the local live buffer.
       await queryClient.invalidateQueries({ queryKey: ["game"] });
       setLive(null);
     }
@@ -93,7 +108,10 @@ export default function GamePage() {
   if (!ready || isLoading) {
     return (
       <div className="center-screen">
-        <p className="empty">Loading your quest...</p>
+        <div className="loader">
+          <span className="loader-spinner" />
+          <p className="empty">Loading your quest...</p>
+        </div>
       </div>
     );
   }
@@ -101,8 +119,11 @@ export default function GamePage() {
   return (
     <div className="game-shell">
       <header className="topbar">
-        <h1>QuestForge</h1>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div className="brand">
+          <h1>QuestForge</h1>
+          <span className="tagline">AI Game Master &middot; text-adventure RPG</span>
+        </div>
+        <div className="topbar-actions">
           {game && (
             <button
               className="btn-secondary"
@@ -119,28 +140,61 @@ export default function GamePage() {
       </header>
 
       {!game ? (
-        <div className="panel" style={{ gridColumn: "1 / -1", textAlign: "center" }}>
-          <p>You have no active quest.</p>
-          <button
-            className="btn-primary"
-            style={{ maxWidth: 220, margin: "12px auto 0" }}
-            onClick={() => startMutation.mutate()}
-            disabled={startMutation.isPending}
-          >
-            {startMutation.isPending ? "Forging..." : "Start a new game"}
-          </button>
+        <div className="hero">
+          <div className="hero-card">
+            <div className="hero-emblem">&#9876;</div>
+            <h2>Your quest awaits</h2>
+            <p className="hero-lead">
+              A torch-lit dungeon lies ahead, narrated by an AI Game Master. Explore
+              the rooms, claim the iron sword, defeat the goblin, and reach the
+              Treasure Vault.
+            </p>
+            <ol className="hero-steps">
+              <li>Head north into the Great Hall</li>
+              <li>Grab the iron sword from the armory</li>
+              <li>Defeat the goblin in its lair</li>
+              <li>Return and go north to the Treasure Vault</li>
+            </ol>
+            <button
+              className="btn-primary hero-start"
+              onClick={() => startMutation.mutate()}
+              disabled={startMutation.isPending}
+            >
+              {startMutation.isPending ? "Forging your quest..." : "Start a new game"}
+            </button>
+          </div>
         </div>
       ) : (
-        <>
+        <div className="game-grid">
           <StatsPanel game={game} />
 
           <main className="panel log">
-            {game.status === "won" && <div className="banner won">Victory! You cleared the dungeon.</div>}
-            {game.status === "lost" && <div className="banner lost">You have fallen. Game over.</div>}
+            {game.status === "won" && (
+              <div className="banner won">Victory! You cleared the dungeon.</div>
+            )}
+            {game.status === "lost" && (
+              <div className="banner lost">You have fallen. Game over.</div>
+            )}
 
             <GameLog turns={game.turns} live={live} />
 
             {actionError && <div className="error-box">{actionError}</div>}
+
+            {game.status === "active" && (
+              <div className="suggestions">
+                {suggestedCommands(game).map((cmd) => (
+                  <button
+                    key={cmd}
+                    type="button"
+                    className="suggestion-chip"
+                    disabled={busy}
+                    onClick={() => setAction(cmd)}
+                  >
+                    {cmd}
+                  </button>
+                ))}
+              </div>
+            )}
 
             <form className="action-bar" onSubmit={submitAction}>
               <input
@@ -155,8 +209,7 @@ export default function GamePage() {
                 disabled={busy || game.status !== "active"}
               />
               <button
-                className="btn-primary"
-                style={{ width: "auto", padding: "0 20px" }}
+                className="btn-primary act-btn"
                 type="submit"
                 disabled={busy || game.status !== "active" || !action.trim()}
               >
@@ -164,7 +217,7 @@ export default function GamePage() {
               </button>
             </form>
           </main>
-        </>
+        </div>
       )}
     </div>
   );

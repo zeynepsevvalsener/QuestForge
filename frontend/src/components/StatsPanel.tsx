@@ -12,7 +12,7 @@ export function StatsPanel({ game }: { game: GameState }) {
   const ratio = game.max_hp > 0 ? game.hp / game.max_hp : 0;
 
   return (
-    <aside className="panel">
+    <aside className="panel stats-panel">
       <div className="stat-row">
         <span className="label">Status</span>
         <span className={`badge ${game.status}`}>{game.status}</span>
@@ -39,13 +39,50 @@ export function StatsPanel({ game }: { game: GameState }) {
         <span>{game.room?.name ?? game.location}</span>
       </div>
 
-      {game.room?.enemy && (
-        <div className="stat-row">
-          <span className="label">Enemy</span>
-          <span style={{ color: "var(--danger)" }}>
-            {game.room.enemy} ({game.enemy_hp} HP)
-          </span>
+      {game.objective && (
+        <div className="objective">
+          <span className="label">Objective</span>
+          <p>{game.objective}</p>
         </div>
+      )}
+
+      {game.room?.enemy && (
+        <div className="enemy-panel">
+          <div className="section-title" style={{ margin: "0 0 8px" }}>
+            Enemy
+          </div>
+          <div className="enemy-row">
+            <span className="enemy-name">{game.room.enemy}</span>
+            <span className="enemy-hp-text">
+              {game.enemy_hp} / {game.enemy_max_hp}
+            </span>
+          </div>
+          <div className="enemy-bar">
+            <div
+              className="enemy-bar-fill"
+              style={{
+                width: `${Math.max(
+                  0,
+                  Math.min(100, (game.enemy_hp / game.enemy_max_hp) * 100),
+                )}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {game.progress?.length > 0 && (
+        <>
+          <div className="section-title">Quest Progress</div>
+          <ul className="progress-list">
+            {game.progress.map((step) => (
+              <li key={step.label} className={step.done ? "done" : ""}>
+                <span className="check">{step.done ? "\u2611" : "\u2610"}</span>
+                {step.label}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
 
       <div className="section-title">Exits</div>

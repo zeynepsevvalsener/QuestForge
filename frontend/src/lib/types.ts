@@ -24,11 +24,22 @@ export interface Turn {
 
 export interface ToolCallRecord {
   tool: string;
-  args: Record<string, unknown>;
-  accepted: boolean;
+  action?: string;
+  args?: Record<string, unknown>;
+  ok?: boolean;
+  message?: string;
+  error?: string;
+  events?: string[];
+  // Legacy fields (older persisted turns).
+  accepted?: boolean;
   reason?: string;
   result?: string;
   [key: string]: unknown;
+}
+
+export interface QuestStep {
+  label: string;
+  done: boolean;
 }
 
 export interface GameState {
@@ -37,8 +48,11 @@ export interface GameState {
   hp: number;
   max_hp: number;
   location: string;
+  objective: string;
+  progress: QuestStep[];
   room: Room;
   enemy_hp: number;
+  enemy_max_hp: number;
   inventory: InventoryItem[];
   alive: boolean;
   turns: Turn[];
